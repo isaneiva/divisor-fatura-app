@@ -1209,7 +1209,7 @@ body.has-bulk .spacer { height: 210px; }
     else if (!S.rows.length) {
       t = 'Nenhum lançamento ainda';
       d = S.local
-        ? 'Toque em Adicionar por texto para colar ou digitar os lançamentos, ou use Restaurar backup, no fim da página, para trazer os que você já tem.'
+        ? 'Toque em Adicionar por foto ou PDF para ler os prints ou o PDF da fatura, ou em Adicionar por texto para colar ou digitar. Para trazer os lançamentos que você já tem, use Restaurar backup, no fim da página.'
         : 'Toque em Adicionar por foto ou PDF e envie os prints da fatura. Os lançamentos aparecem aqui, prontos para você dizer o que foi e de quem é.';
     }
     else if (!count) {
@@ -2132,6 +2132,8 @@ body.has-bulk .spacer { height: 210px; }
       case 'senha': return 'o PDF tem senha; envie uma cópia sem senha ou prints das páginas';
       case 'image_rejected': return 'a imagem foi recusada (grande demais ou formato não aceito)';
       case 'refused': return 'o Claude não leu este arquivo';
+      case 'ocr': return 'o leitor de texto não carregou; confira a internet e tente de novo';
+      case 'ocrfalha': return 'não consegui reconhecer o texto desta imagem';
       case 'invalid_json':
       case 'empty_completion': return 'a leitura veio incompleta; tente de novo';
       default: return 'falha na leitura; tente de novo';
@@ -2233,6 +2235,7 @@ body.has-bulk .spacer { height: 210px; }
 
   function startImport(files) {
     if (!files.length || IMP.state === 'reading' || IMP.state === 'saving') return;
+    if (S.local) { startLocalImport(files); return; }
     if (!S.sample) { toast(UNAVAILABLE); return; }
     var ctl = new AbortController();
     IMP = impIdle();
@@ -2349,7 +2352,7 @@ body.has-bulk .spacer { height: 210px; }
     if (IMP.state === 'reading' || IMP.state === 'saving') msg = 'Espere a leitura atual terminar.';
     else if (!S.ready) msg = 'A página ainda está carregando. Tente de novo em instantes.';
     else if (!S.canWrite || !S.db) msg = 'Você não tem permissão para adicionar lançamentos nesta página.';
-    else if (!S.sample) msg = UNAVAILABLE;
+    else if (!S.sample && !S.local) msg = UNAVAILABLE;
     if (msg) { e.preventDefault(); toast(msg); return; }
     el.file.value = '';
     armPickHint();
@@ -2386,6 +2389,375 @@ body.has-bulk .spacer { height: 210px; }
     paintRv(li, it);
     renderImp();
   });
+
+  /* ---------- leitura no próprio aparelho (app instalado, sem o Claude) ---------- */
+  var TESS_JS = 'https://cdn.jsdelivr.net/npm/tesseract.js@7.0.0/dist/';
+  var TESS_CORE = 'https://cdn.jsdelivr.net/npm/tesseract.js-core@7.0.0';
+  var TESS_LANG = 'https://cdn.jsdelivr.net/npm/@tesseract.js-data/por@1.0.0/4.0.0_best_int';
+  var tessLoad = null;
+  function loadTesseract() {
+    if (!tessLoad) {
+      tessLoad = loadScript(TESS_JS + 'tesseract.min.js').then(function () {
+        if (!window.Tesseract) throw { local: 'ocr' };
+        return window.Tesseract;
+      }, function () { throw { local: 'ocr' }; });
+      tessLoad.catch(function () { tessLoad = null; });
+    }
+    return tessLoad;
+  }
+
+  var MES_NUM = { jan: 1, fev: 2, mar: 3, abr: 4, mai: 5, jun: 6, jul: 7, ago: 8, set: 9, out: 10, nov: 11, dez: 12 };
+  var RE_HEAD = /^(\d{1,2})\s*(?:de\s*)?(janeiro|fevereiro|mar[cç]o|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro)(?:\s*(?:de\s*)?(\d{4}))?$/i;
+  var RE_AMT = /^(?:[-−–+]\s*)?(?:R\s?[$S5]{1,2}|[$S])?\s*(?:[-−–]\s*)?\d{1,3}(?:\.\d{3})*,\d{2}$/i;
+  var RE_NAME_AMT = /^(.{3,}?)\s+((?:[-−–]\s*)?R\s?[$S5]\s*(?:[-−–]\s*)?\d{1,3}(?:\.\d{3})*,\d{2})$/i;
+  var RE_PARC = /^parcela\s*(\d{1,2})\s*de\s*(\d{1,2})$/i;
+  var RE_TIME = /^[àáa]s?\s*[\dOo]{1,2}\s*[h:]\s*[\dOo]{2}$/i;
+  var RE_SUB = /carteiras?\s*digita|cart[aã]o\s*virtual|^adicional$|\sadicional$|no\s*cr[eé]dito|no\s*d[eé]bito|^titular$/i;
+  var RE_SKIP = /pagamento\s*(?:de\s*|da\s*)?fatura|pagamento\s*(?:efetuado|recebido)|fatura\s*anterior|saldo\s*(?:anterior|financiado|devedor|em\s*aberto)|^total\b|total\s*(?:da|desta|de|dos)\s|limite\s*(?:de|dispon|total|[uú]nico)|pagamento\s*m[ií]nimo/i;
+  var RE_FUTURE = /pr[oó]xim[ao]s?\s+faturas?|parcelas?\s+futuras|lan[cç]amentos\s+futuros|compras\s+parceladas\s*-\s*pr[oó]xim/i;
+  var RE_CURRENT = /lan[cç]amentos\s*(?:atuais|nacionais|internacionais|no\s+cart[aã]o|:)|transa[cç][oõ]es\s+(?:nacionais|internacionais)/i;
+  var AMT_SRC = '((?:[-−–+]\\s*)?(?:R\\$\\s*)?(?:[-−–]\\s*)?\\d{1,3}(?:\\.\\d{3})*,\\d{2})(?:\\s?(-|CR?)(?=\\s|$))?(?=\\s|$)';
+  var RE_ROW = new RegExp('(?:^|\\s)(\\d{1,2})[\\/.](\\d{1,2})(?:[\\/.](\\d{4}|\\d{2}))?\\s+(.+?)\\s+' + AMT_SRC, 'g');
+  var RE_ROW_MES = new RegExp('(?:^|\\s)(\\d{1,2})\\s+(jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez)[a-zç]*\\.?(?:\\s+(\\d{4}))?\\s+(.+?)\\s+' + AMT_SRC, 'gi');
+
+  function amountOf(s) {
+    var m = /(\d{1,3}(?:\.\d{3})*,\d{2})\s*(-|CR?)?\s*$/i.exec(String(s));
+    if (!m) return null;
+    var c = parseMoney(m[1]);
+    if (c == null) return null;
+    return /[-−–]/.test(String(s)) || /^c/i.test(m[2] || '') ? -Math.abs(c) : c;
+  }
+  function makeItem(name, date, cents, p, t, via) {
+    var it = blankItem();
+    it.name = String(name).slice(0, 80);
+    it.date = date;
+    it.cents = cents;
+    it.parcela = p || null;
+    it.parcelas = p ? t : null;
+    it.via = via || '';
+    return it;
+  }
+
+  /* Linhas do OCR (saída TSV do Tesseract) com posição na imagem. */
+  function tsvToLines(tsv) {
+    var map = {};
+    var order = [];
+    String(tsv || '').split('\n').forEach(function (row) {
+      var c = row.split('\t');
+      if (c[0] !== '5') return;
+      var txt = (c[11] || '').trim();
+      if (!txt) return;
+      var k = c[1] + '.' + c[2] + '.' + c[3] + '.' + c[4];
+      var o = map[k];
+      if (!o) { o = map[k] = { words: [], l: 1e9, t: 1e9, r: 0, b: 0, conf: 0 }; order.push(o); }
+      var l = +c[6], t = +c[7], w = +c[8], h = +c[9];
+      o.words.push({ x: l, text: txt });
+      o.l = Math.min(o.l, l); o.t = Math.min(o.t, t); o.r = Math.max(o.r, l + w); o.b = Math.max(o.b, t + h);
+      o.conf += +c[10] || 0;
+    });
+    return order.map(function (o) {
+      o.words.sort(function (a, b) { return a.x - b.x; });
+      return { text: o.words.map(function (w) { return w.text; }).join(' '), l: o.l, t: o.t, r: o.r, b: o.b, conf: o.conf / o.words.length };
+    }).sort(function (a, b) { return a.t - b.t; });
+  }
+
+  /* Print de aplicativo: a data vem num cabeçalho e cada compra é um bloco com nome, valor e detalhes. */
+  function emitCluster(cl, out) {
+    var amts = cl.members.filter(function (c) { return c.k === 'amt' && c.cents != null; });
+    amts.forEach(function (a) {
+      var ay = (a.ln.t + a.ln.b) / 2;
+      var mine = cl.members.filter(function (c) {
+        if (c.k === 'amt') return false;
+        if (amts.length === 1) return true;
+        var cy = (c.ln.t + c.ln.b) / 2;
+        var best = a, bd = Math.abs(cy - ay);
+        amts.forEach(function (o) { var d = Math.abs(cy - (o.ln.t + o.ln.b) / 2); if (d < bd) { bd = d; best = o; } });
+        return best === a;
+      });
+      var parts = mine.filter(function (c) { return c.k === 'text' && (c.ln.l + c.ln.r) / 2 < a.ln.l; });
+      parts.sort(function (x, y) {
+        var cx = (x.ln.t + x.ln.b) / 2, cy = (y.ln.t + y.ln.b) / 2;
+        if (Math.abs(cx - cy) < Math.min(x.ln.b - x.ln.t, y.ln.b - y.ln.t) * 0.5) return x.ln.l - y.ln.l;
+        return cx - cy;
+      });
+      var name = clean(parts.map(function (c) { return c.ln.text; }).join(' '));
+      var parc = mine.filter(function (c) { return c.k === 'parc'; })[0];
+      var sub = mine.filter(function (c) { return c.k === 'sub'; })[0];
+      var p = null, t = null;
+      if (parc && parc.p >= 1 && parc.p <= parc.t) {
+        p = parc.p; t = parc.t;
+        // O marcador "01/12" vem grudado no nome e o zero costuma ser lido como letra "o".
+        var two = function (n) { return n < 10 ? '[0Oo]\\s?' + n : String(n); };
+        var marker = new RegExp('\\s*' + two(p) + '\\s?\\/\\s?' + two(t) + '$');
+        name = marker.test(name) ? name.replace(marker, '') : name.replace(/\s*\d[\dOo]*\/\d{1,2}$/, '');
+        // Sobra comum da leitura: o zero do marcador vira "0o" ou "oo" e deixa um caractere a mais no fim do nome.
+        name = name.replace(/([A-Za-zÀ-ÿ])0$/, '$1').replace(/oo$/, 'o');
+      } else {
+        var m = /\s(\d{1,2})\/(\d{1,2})$/.exec(name);
+        if (m && +m[1] >= 1 && +m[1] <= +m[2]) { p = +m[1]; t = +m[2]; name = name.slice(0, m.index); }
+      }
+      name = clean(name);
+      if (!name || RE_SKIP.test(name)) return;
+      out.push(makeItem(name, cl.date ? inferDate(cl.date.d, cl.date.m, cl.date.y) : null, a.cents, p, t, sub ? sub.via : ''));
+    });
+  }
+  function parseScreen(lines) {
+    var cls = [];
+    lines.forEach(function (ln) {
+      var s = clean(ln.text);
+      var m;
+      if ((m = RE_HEAD.exec(s))) { cls.push({ k: 'head', ln: ln, d: +m[1], m: MES_NUM[keyOf(m[2]).slice(0, 3)], y: +m[3] || 0 }); return; }
+      if ((m = RE_PARC.exec(s))) { cls.push({ k: 'parc', ln: ln, p: +m[1], t: +m[2] }); return; }
+      if (RE_TIME.test(s)) return;
+      if (RE_AMT.test(s)) { cls.push({ k: 'amt', ln: ln, cents: amountOf(s) }); return; }
+      if ((m = RE_NAME_AMT.exec(s))) {
+        var cut = ln.l + (ln.r - ln.l) * (m[1].length / s.length);
+        cls.push({ k: 'text', ln: { text: m[1], l: ln.l, t: ln.t, r: cut, b: ln.b, conf: ln.conf } });
+        cls.push({ k: 'amt', ln: { text: m[2], l: cut + 1, t: ln.t, r: ln.r, b: ln.b, conf: ln.conf }, cents: amountOf(m[2]) });
+        return;
+      }
+      if (RE_SUB.test(s)) {
+        cls.push({ k: 'sub', ln: ln, via: /carteiras?\s*digita/i.test(s) ? 'carteira' : (/cart[aã]o\s*virtual/i.test(s) ? 'virtual' : (/adicional/i.test(s) ? 'adicional' : '')) });
+        return;
+      }
+      var alnum = s.replace(/[^A-Za-zÀ-ÿ0-9]/g, '').length;
+      if (alnum < 2 || ln.conf < 30) return;
+      cls.push({ k: alnum < 3 ? 'short' : 'text', ln: ln });
+    });
+    var texts = cls.filter(function (c) { return c.k === 'text'; });
+    var hs = texts.map(function (c) { return c.ln.b - c.ln.t; }).sort(function (a, b) { return a - b; });
+    var med = hs.length ? hs[hs.length >> 1] : 20;
+    var gap = med * 1.6;
+    // Pedaços de 2 letras só valem se começam na mesma margem dos nomes (ex.: "Dl *uberrides"); o resto é ícone lido como letra.
+    var margin = null, votes = 0;
+    texts.forEach(function (c) {
+      var n = texts.filter(function (o) { return Math.abs(o.ln.l - c.ln.l) <= med * 0.5; }).length;
+      if (n > votes) { votes = n; margin = c.ln.l; }
+    });
+    cls = cls.filter(function (c) {
+      if (c.k !== 'short') return true;
+      if (margin == null || Math.abs(c.ln.l - margin) > med * 0.5 || c.ln.conf < 60) return false;
+      c.k = 'text';
+      return true;
+    });
+    var out = [];
+    var heads = 0, date = null, cur = null;
+    function flush() { if (cur) { emitCluster(cur, out); cur = null; } }
+    cls.forEach(function (c) {
+      if (c.k === 'head') { flush(); heads++; date = c; return; }
+      if (!cur || c.ln.t - cur.b > gap) { flush(); cur = { members: [], b: c.ln.b, date: date }; }
+      cur.members.push(c);
+      cur.b = Math.max(cur.b, c.ln.b);
+    });
+    flush();
+    return { items: out, heads: heads };
+  }
+
+  /* Tabela de fatura: cada linha traz data, descrição e valor (PDF ou foto de fatura em papel). */
+  function parseRows(rows, st) {
+    var out = [];
+    rows.forEach(function (row) {
+      var s = String(row);
+      if (RE_FUTURE.test(s)) st.future = true; else if (RE_CURRENT.test(s)) st.future = false;
+      [RE_ROW, RE_ROW_MES].forEach(function (re, mode) {
+        re.lastIndex = 0;
+        var m;
+        while ((m = re.exec(s))) {
+          var mo = mode ? MES_NUM[m[2].toLowerCase().slice(0, 3)] : +m[2];
+          var desc = clean(m[4]);
+          var cents = amountOf(m[5] + (m[6] ? ' ' + m[6] : ''));
+          if (cents == null || !/[A-Za-zÀ-ÿ]/.test(desc) || RE_SKIP.test(desc)) continue;
+          if (st.future) { st.skipped++; continue; }
+          var p = null, t = null;
+          var pm = /(?:\(|parc(?:ela)?\.?\s*)?(\d{1,2})\s*\/\s*(\d{1,2})\)?$/i.exec(desc);
+          if (pm && +pm[1] >= 1 && +pm[1] <= +pm[2]) {
+            var rest = clean(desc.slice(0, pm.index)).replace(/[\s\-–·,(]+$/, '');
+            if (rest) { p = +pm[1]; t = +pm[2]; desc = rest; }
+          }
+          out.push(makeItem(desc, inferDate(+m[1], mo, +m[3] || 0), cents, p, t, ''));
+        }
+      });
+    });
+    return out;
+  }
+  function ocrRows(lines) {
+    var rows = [];
+    lines.forEach(function (ln) {
+      var cy = (ln.t + ln.b) / 2;
+      var row = null;
+      for (var i = rows.length - 1; i >= 0; i--) { if (cy >= rows[i].t && cy <= rows[i].b) { row = rows[i]; break; } }
+      if (!row) { row = { t: ln.t, b: ln.b, parts: [] }; rows.push(row); }
+      row.parts.push(ln);
+    });
+    return rows.map(function (r) {
+      return r.parts.sort(function (a, b) { return a.l - b.l; }).map(function (p) { return p.text; }).join('   ');
+    });
+  }
+  function linesToItems(lines, st) {
+    var screen = parseScreen(lines);
+    if (screen.heads && screen.items.length) return screen.items;
+    var table = parseRows(ocrRows(lines), st);
+    return table.length >= screen.items.length ? table : screen.items;
+  }
+  function pdfLines(items) {
+    var rows = [];
+    items.forEach(function (it) {
+      var s = it.str;
+      if (!s || !s.trim() || !it.transform) return;
+      var x = it.transform[4], y = it.transform[5];
+      var h = Math.abs(it.transform[3]) || it.height || 8;
+      var row = null;
+      for (var i = rows.length - 1; i >= 0; i--) { if (Math.abs(rows[i].y - y) <= Math.max(2, h * 0.3)) { row = rows[i]; break; } }
+      if (!row) { row = { y: y, parts: [] }; rows.push(row); }
+      row.parts.push({ x: x, w: it.width || 0, s: s, h: h });
+    });
+    rows.sort(function (a, b) { return b.y - a.y; });
+    return rows.map(function (r) {
+      r.parts.sort(function (a, b) { return a.x - b.x; });
+      var out = '';
+      var end = null;
+      r.parts.forEach(function (p) {
+        if (end != null) {
+          var g = p.x - end;
+          if (g > p.h * 0.18 && !/\s$/.test(out) && !/^\s/.test(p.s)) out += g > p.h * 2.5 ? '   ' : ' ';
+        }
+        out += p.s;
+        end = p.x + p.w;
+      });
+      return out;
+    });
+  }
+  function canvasForOcr(src, w, h) {
+    var s = Math.min(3, Math.max(1, 1500 / w));
+    if (w > 2400) s = 2400 / w;
+    s = Math.min(s, Math.sqrt(14e6 / (w * h)));
+    var cv = document.createElement('canvas');
+    cv.width = Math.max(1, Math.round(w * s));
+    cv.height = Math.max(1, Math.round(h * s));
+    var x = cv.getContext('2d');
+    x.fillStyle = '#FFFFFF';
+    x.fillRect(0, 0, cv.width, cv.height);
+    x.drawImage(src, 0, 0, cv.width, cv.height);
+    return cv;
+  }
+
+  function startLocalImport(files) {
+    var ctl = new AbortController();
+    IMP = impIdle();
+    IMP.state = 'reading';
+    IMP.status = 'Preparando…';
+    IMP.ctl = ctl;
+    renderImp();
+    try { el.impPanel.scrollIntoView({ block: 'nearest' }); } catch (e) { /* sem rolagem */ }
+    var groups = [];
+    var aborted = new Promise(function (resolve, reject) { ctl.signal.addEventListener('abort', function () { reject({ code: 'cancelled' }); }); });
+    aborted.catch(function () { /* tratado na corrida */ });
+    var job = {
+      worker: null,
+      tag: '',
+      ocr: function (canvas) {
+        var self = this;
+        var ready;
+        if (self.worker) ready = Promise.resolve(self.worker);
+        else {
+          impStatus('Preparando o leitor de texto. Na primeira vez ele é baixado e pode demorar um pouco.');
+          ready = loadTesseract().then(function (T) {
+            return T.createWorker('por', 1, {
+              workerPath: TESS_JS + 'worker.min.js', corePath: TESS_CORE, langPath: TESS_LANG,
+              logger: function (m) { if (m && m.status === 'recognizing text' && IMP.ctl === ctl) impStatus('Lendo ' + self.tag + ' (' + Math.round((m.progress || 0) * 100) + '%)'); }
+            });
+          }).then(function (w) {
+            self.worker = w;
+            return w.setParameters({ tessedit_pageseg_mode: '11', preserve_interword_spaces: '1' }).then(function () { return w; });
+          }).then(null, function (err) { throw err && err.local ? err : { local: 'ocr' }; });
+        }
+        return Promise.race([ready.then(function (w) {
+          return w.recognize(canvas, {}, { text: false, tsv: true }).then(null, function () { throw { local: 'ocrfalha' }; });
+        }), aborted]).then(function (res) { return tsvToLines(res && res.data ? res.data.tsv : ''); });
+      }
+    };
+
+    function readImage(file, g) {
+      return decodeImage(file).then(function (src) {
+        var w = src.naturalWidth || src.width, h = src.naturalHeight || src.height;
+        if (!w || !h) throw { local: 'imagem' };
+        return job.ocr(canvasForOcr(src, w, h));
+      }).then(function (lines) { g.items = linesToItems(lines, g.st); });
+    }
+    function readPdf(file, g) {
+      return loadPdfJs().then(function (lib) {
+        return file.arrayBuffer().then(function (buf) {
+          return lib.getDocument({ data: buf, isEvalSupported: false, disableFontFace: true }).promise;
+        }).then(null, function (err) { throw { local: err && err.name === 'PasswordException' ? 'senha' : 'pdf' }; });
+      }).then(function (pdf) {
+        var total = pdf.numPages;
+        var n = Math.min(total, 30);
+        if (total > n) g.extra = 'só as ' + n + ' primeiras páginas de ' + total + ' foram lidas';
+        var chain = Promise.resolve();
+        function page(p) {
+          if (ctl.signal.aborted) throw { code: 'cancelled' };
+          return pdf.getPage(p).then(function (pg) {
+            return pg.getTextContent().then(function (tc) {
+              var rows = pdfLines(tc.items || []);
+              if (rows.join('').replace(/\s/g, '').length >= 40) { g.items = g.items.concat(parseRows(rows, g.st)); return null; }
+              // Página sem texto (escaneada): vira imagem e passa pelo leitor de texto.
+              var base = pg.getViewport({ scale: 1 });
+              var vp = pg.getViewport({ scale: 1500 / base.width });
+              var cv = document.createElement('canvas');
+              cv.width = Math.round(vp.width);
+              cv.height = Math.round(vp.height);
+              var cx = cv.getContext('2d');
+              cx.fillStyle = '#FFFFFF';
+              cx.fillRect(0, 0, cv.width, cv.height);
+              return pg.render({ canvasContext: cx, viewport: vp }).promise.then(function () { return job.ocr(cv); }).then(function (lines) {
+                g.items = g.items.concat(linesToItems(lines, g.st));
+              });
+            });
+          });
+        }
+        for (var p = 1; p <= n; p++) chain = chain.then(page.bind(null, p));
+        return chain;
+      });
+    }
+
+    var chain = Promise.resolve();
+    files.forEach(function (file, fi) {
+      chain = chain.then(function () {
+        if (ctl.signal.aborted) throw { code: 'cancelled' };
+        var name = file.name || 'arquivo ' + (fi + 1);
+        var g = { name: name, items: [], total: null, skipped: 0, extra: '', st: { future: false, skipped: 0 } };
+        job.tag = (fi + 1) + ' de ' + files.length + ': ' + name;
+        impStatus('Lendo ' + job.tag);
+        var isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(name);
+        var isImg = /^image\//.test(file.type) || /\.(jpe?g|png|webp|gif|bmp)$/i.test(name);
+        var work = isPdf ? readPdf(file, g) : (isImg ? readImage(file, g) : Promise.reject({ local: 'tipo' }));
+        return work.then(function () {
+          groups.push(g);
+        }, function (err) {
+          if (err && err.code === 'cancelled') throw err;
+          if (g.items.length) groups.push(g);
+          IMP.notes.push(g.name + ': ' + impErrText(err && (err.local || err.code) ? err : { local: isPdf ? 'pdf' : 'ocrfalha' }) + '.');
+        }).then(function () {
+          if (g.st.skipped) IMP.notes.push(g.name + ': ' + plural(g.st.skipped, 'lançamento de próximas faturas ficou de fora.', 'lançamentos de próximas faturas ficaram de fora.'));
+        });
+      });
+    });
+    chain.then(function () {
+      if (job.worker) job.worker.terminate();
+      if (IMP.ctl !== ctl) return;
+      finishImport(groups, '');
+    }, function (err) {
+      if (job.worker) job.worker.terminate();
+      if (IMP.ctl !== ctl) return;
+      if (err && err.code === 'cancelled') {
+        IMP = impIdle();
+        renderImp();
+        toast('Leitura interrompida. Nada foi adicionado.');
+        return;
+      }
+      finishImport(groups, 'Não consegui ler os arquivos. Tente de novo.');
+    });
+  }
 
   /* ---------- adicionar por texto ou à mão ---------- */
   function todayISO() { var n = new Date(); return n.getFullYear() + '-' + pad2(n.getMonth() + 1) + '-' + pad2(n.getDate()); }
@@ -2512,7 +2884,6 @@ body.has-bulk .spacer { height: 210px; }
     S.db = makeLocalDb();
     S.dl = makeLocalDl();
     S.ready = true;
-    el.addBtn.hidden = true;
     var share = canShareFiles();
     el.btnSharePdf.hidden = !share;
     el.btnShareJpg.hidden = !share;

@@ -1,5 +1,5 @@
 /* Divisor de Fatura: guarda o app no aparelho para abrir sem internet. */
-const CACHE = 'divisor-fatura-v1';
+const CACHE = 'divisor-fatura-v2';
 const CORE = ['./', './index.html', './manifest.webmanifest', './icon-192.png', './icon-512.png'];
 
 self.addEventListener('install', (event) => {
@@ -23,7 +23,8 @@ self.addEventListener('fetch', (event) => {
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
   const same = url.origin === self.location.origin;
-  const fonts = url.hostname === 'fonts.googleapis.com' || url.hostname === 'fonts.gstatic.com';
+  // Fontes e os leitores de PDF e de texto vêm de fora; ficam guardados depois do primeiro uso.
+  const fonts = ['fonts.googleapis.com', 'fonts.gstatic.com', 'cdn.jsdelivr.net', 'cdnjs.cloudflare.com'].includes(url.hostname);
   if (!same && !fonts) return;
   if (same) {
     // Rede primeiro: uma versão nova enviada ao GitHub chega na próxima abertura com internet.
